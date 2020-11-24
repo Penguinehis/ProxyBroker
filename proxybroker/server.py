@@ -25,24 +25,42 @@ class ProxyPool:
     """Imports and gives proxies from queue on demand."""
 
     def __init__(
-        self, proxies, min_req_proxy=5, max_error_rate=0.5, max_resp_time=8
+        self,
+        proxies,
+        min_req_proxy=5,
+        max_error_rate=0.5,
+        max_resp_time=8,
+        min_queue=5,
+        strategy='best',
     ):
         self._proxies = proxies
         self._pool = []
+        self._newcomers = []
+        self._strategy = strategy
         self._min_req_proxy = min_req_proxy
-        # if num of erros greater or equal 50% - proxy will be remove from pool
+        # if num of errors greater or equal 50% - proxy will be remove from pool
         self._max_error_rate = max_error_rate
         self._max_resp_time = max_resp_time
+        self._min_queue = min_queue
+
+        if strategy != 'best':
+            raise ValueError('`strategy` only support `best` for now.')
 
     async def get(self, scheme):
         scheme = scheme.upper()
-        for priority, proxy in self._pool:
-            if scheme in proxy.schemes:
-                chosen = proxy
-                self._pool.remove((proxy.priority, proxy))
-                break
-        else:
+        if len(self._pool) + len(self._newcomers) < self._min_queue:
             chosen = await self._import(scheme)
+        elif len(self._newcomers) > 0:
+            chosen = self._newcomers.pop(0)
+        elif self._strategy == 'best':
+            for priority, proxy in self._pool:
+                if scheme in proxy.schemes:
+                    chosen = proxy
+                    self._pool.remove((proxy.priority, proxy))
+                    break
+            else:
+                chosen = await self._import(scheme)
+
         return chosen
 
     async def _import(self, expected_scheme):
@@ -57,16 +75,32 @@ class ProxyPool:
                 return proxy
 
     def put(self, proxy):
-        if proxy.stat['requests'] >= self._min_req_proxy and (
-            (proxy.error_rate > self._max_error_rate)
-            or (proxy.avg_resp_time > self._max_resp_time)
-        ):
-            log.debug(
-                '%s:%d removed from proxy pool' % (proxy.host, proxy.port)
-            )
+        is_exceed_time = (proxy.error_rate > self._max_error_rate) or (
+            proxy.avg_resp_time > self._max_resp_time
+        )
+        if proxy.stat['requests'] < self._min_req_proxy:
+            self._newcomers.append(proxy)
+        elif proxy.stat['requests'] >= self._min_req_proxy and is_exceed_time:
+            log.debug('%s:%d removed from proxy pool' % (proxy.host, proxy.port))
         else:
             heapq.heappush(self._pool, (proxy.priority, proxy))
+
         log.debug('%s:%d stat: %s' % (proxy.host, proxy.port, proxy.stat))
+
+    def remove(self, host, port):
+        for proxy in self._newcomers:
+            if proxy.host == host and proxy.port == port:
+                chosen = proxy
+                self._newcomers.remove(proxy)
+                break
+        else:
+            for priority, proxy in self._pool:
+                if proxy.host == host and proxy.port == port:
+                    chosen = proxy
+                    self._pool.remove((proxy.priority, proxy))
+                    break
+
+        return chosen
 
 
 class Server:
@@ -168,7 +202,48 @@ class Server:
             'client: %d; request: %s; headers: %s; scheme: %s'
             % (client, request, headers, scheme)
         )
+        # API for controlling proxybroker2
+        if headers['Host'] == 'proxycontrol':
+            _api, _operation, _params = headers['Path'].split('/', 5)[3:]
+            if _api == 'api':
+                if _operation == 'remove':
+                    proxy_host, proxy_port = _params.split(':', 1)
+                    self._proxy_pool.remove(proxy_host, int(proxy_port))
+                    log.debug(
+                        'Remove Proxy: client: %d; request: %s; headers: %s; scheme: %s; proxy_host: %s; proxy_port: %s'
+                        % (client, request, headers, scheme, proxy_host, proxy_port)
+                    )
+                    client_writer.write(b'HTTP/1.1 204 No Content\r\n\r\n')
+                    await client_writer.drain()
+                    return
+                elif _operation == 'history':
+                    query_type, url = _params.split(':', 1)
+                    if query_type == 'url':
+                        previous_proxy = history.get(
+                            f"{client_reader._transport.get_extra_info('peername')[0]}-{url}"
+                        )
+                        if previous_proxy is None:
+                            client_writer.write(b'HTTP/1.1 204 No Content\r\n\r\n')
+                            await client_writer.drain()
+                            return
+                        else:
+                            previous_proxy_bytestring = (
+                                '{"proxy": "%s"}' % previous_proxy
+                            ).encode()
+                            client_writer.write(b'HTTP/1.1 200 OK\r\n')
+                            client_writer.write(b'Content-Type: application/json\r\n')
+                            client_writer.write(
+                                f"Content-Length: {str(len(previous_proxy_bytestring) + 2).encode()}\r\n"
+                            )
+                            client_writer.write(b'Access-Control-Allow-Origin: *\r\n')
+                            client_writer.write(
+                                b'Access-Control-Allow-Credentials: true\r\n\r\n'
+                            )
 
+                            client_writer.write(previous_proxy_bytestring + b'\r\n')
+                            await client_writer.drain()
+                            return
+                            
         for attempt in range(self._max_tries):
             stime, err = 0, None
             proxy = await self._proxy_pool.get(scheme)
