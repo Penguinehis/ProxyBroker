@@ -279,13 +279,6 @@ class Server:
                 else:  # proto: HTTP & HTTPS
                     await proxy.send(request)
 
-                history[
-                    f"{client_reader._transport.get_extra_info('peername')[0]}-{headers['Path']}"
-                ] = (proxy.host + ':' + str(proxy.port))
-                inject_resp_header = {
-                    'headers': {'X-Proxy-Info': proxy.host + ':' + str(proxy.port)}
-                }
-
                 stime = time.time()
                 stream = [
                     asyncio.ensure_future(
@@ -296,7 +289,6 @@ class Server:
                             reader=proxy.reader,
                             writer=client_writer,
                             scheme=scheme,
-                            inject=inject_resp_header,
                         )
                     ),
                 ]
